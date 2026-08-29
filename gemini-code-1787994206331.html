@@ -1,0 +1,1405 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Three.js GLB Viewer with Full P2P Sync & UI Aircraft Selector</title>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            font-family: sans-serif;
+            background-color: #1a1a1a;
+            color: #fff;
+        }
+        #file-input-container {
+            position: absolute;
+            top: 20px;
+            left: 20px;
+            z-index: 10;
+            background: rgba(0, 0, 0, 0.7);
+            padding: 10px 15px;
+            border-radius: 8px;
+        }
+        #p2p-container {
+            position: absolute;
+            top: 90px;
+            left: 20px;
+            z-index: 10;
+            background: rgba(0, 0, 0, 0.85);
+            padding: 12px 15px;
+            border-radius: 8px;
+            width: 260px;
+            font-size: 14px;
+        }
+        #p2p-container input, #p2p-container button {
+            width: 100%;
+            margin-top: 5px;
+            box-sizing: border-box;
+            background: #222;
+            color: #fff;
+            border: 1px solid #555;
+            padding: 6px;
+            border-radius: 4px;
+        }
+        #p2p-container button {
+            background: #ff4444;
+            border: none;
+            font-weight: bold;
+            cursor: pointer;
+        }
+        #p2p-container button:hover {
+            background: #ff6666;
+        }
+        #aircraft-selector {
+            position: absolute;
+            top: 230px;
+            left: 20px;
+            z-index: 10;
+            background: rgba(0, 0, 0, 0.85);
+            padding: 12px 15px;
+            border-radius: 8px;
+            width: 260px;
+            font-size: 14px;
+        }
+        #aircraft-selector button {
+            width: 100%;
+            margin-top: 5px;
+            box-sizing: border-box;
+            background: #333;
+            color: #fff;
+            border: 1px solid #555;
+            padding: 6px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-weight: bold;
+        }
+        #aircraft-selector button:hover {
+            background: #555;
+        }
+        #canvas-container {
+            width: 100vw;
+            height: 100vh;
+        }
+        #ui-container {
+            position: absolute;
+            bottom: 20px;
+            left: 20px;
+            z-index: 10;
+            background: rgba(0, 0, 0, 0.7);
+            padding: 10px 15px;
+            border-radius: 8px;
+            width: 200px;
+        }
+        #load-bar-container {
+            width: 100%;
+            background: #444;
+            height: 15px;
+            border-radius: 4px;
+            margin-top: 5px;
+            overflow: hidden;
+        }
+        #load-bar {
+            width: 0%;
+            height: 100%;
+            background: #ff4444;
+            transition: width 0.1s linear;
+        }
+        #rpm-display {
+            position: absolute;
+            top: 20px;
+            right: 20px;
+            z-index: 10;
+            background: rgba(0, 0, 0, 0.7);
+            padding: 10px 15px;
+            border-radius: 8px;
+            font-size: 18px;
+            font-weight: bold;
+        }
+    </style>
+</head>
+<body>
+
+    <div id="file-input-container">
+        <label for="glb-input"><strong>[ホスト用] GLBファイル選択: </strong></label>
+        <input type="file" id="glb-input" accept=".glb">
+    </div>
+
+    <div id="p2p-container">
+        <div><strong>オンライン飛行 完全ギミック同期システム</strong></div>
+        <div style="margin-top:8px;">
+            番号入力欄 (部屋番号):
+            <input type="text" id="room-input" value="36541">
+        </div>
+        <button id="btn-connect" style="margin-top:8px;">決定で接続・同期</button>
+        <div id="p2p-status" style="margin-top:8px; color:#ff4ff4; font-size:12px;">状態: 未接続</div>
+    </div>
+
+    <div id="aircraft-selector">
+        <div><strong>操作機体 選択UI</strong></div>
+        <button id="btn-mh60">MH60 (scene_20)</button>
+        <button id="btn-mh602">MH602 (scene_20_1)</button>
+        <button id="btn-uh60j">UH60J (scene_10glb)</button>
+    </div>
+
+    <div id="ui-container">
+        <div><strong>被弾ダメージゲージ</strong></div>
+        <div id="load-bar-container">
+            <div id="load-bar"></div>
+        </div>
+    </div>
+
+    <div id="rpm-display">RPM: <span id="rpm-value">0</span></div>
+
+    <div id="canvas-container"></div>
+
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+                "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+            }
+        }
+    </script>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+        import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+
+        let scene, camera, renderer, controls;
+        let currentModel = null;
+        let tracers = [];
+        let smokeParticles = [];
+        let explosionParticles = [];
+
+        let syncChannel = null;
+        let isConnected = false;
+        let storedGlbBuffer = null;
+
+        function createAircraftState() {
+            return {
+                group: null,
+                mainRotorBone: null,
+                tailRotorBone: null,
+                reconPanBone: null,
+                reconTiltBone: null,
+                collectiveCpltBone: null,
+                collectivePltBone: null,
+                rotorBrakeBone: null,
+                horizontalStabBone: null,
+                engine1Bone: null,
+                engine2Bone: null,
+                antiTorquePltRightBone: null,
+                antiTorquePltLeftBone: null,
+                antiTorqueCpltLeftBone: null,
+                antiTorqueCpltRightBone: null,
+                cyclicPltBone: null,
+                cyclicCpltBone: null,
+                hoistBone: null,
+                cabinDoorRightBone: null,
+                cabinDoorLeftBone: null,
+                doorGunRightTiltBone: null,
+                doorGunRightPanBone: null,
+                doorGunLeftTiltBone: null,
+                doorGunLeftPanBone: null,
+                doorGunRightBarrelBone: null,
+                doorGunLeftBarrelBone: null,
+                doorGunRightTiltProgress: 0,
+                doorGunRightPanProgress: 0,
+                doorGunLeftTiltProgress: 0,
+                doorGunLeftPanProgress: 0,
+                doorGunRightTiltVel: 0,
+                doorGunRightPanVel: 0,
+                doorGunLeftTiltVel: 0,
+                doorGunLeftPanVel: 0,
+                doorGunRightBarrelVel: 0,
+                doorGunLeftBarrelVel: 0,
+                hitCount: 0,
+                isDestroyed: false,
+                activeWeaponSide: 6,
+                isFiring: false,
+                fireTimer: 0,
+                attitudeIndicators: [],
+                collectiveAngle: 0,
+                currentThrottle: 0,
+                brakeProgress: 0,
+                brakeLoad: 0,
+                stabAngle: 0,
+                engine1Angle: 0,
+                engine2Angle: 0,
+                antiTorqueProgress: 0,
+                cyclicXProgress: 0,
+                cyclicZProgress: 0,
+                hoistY: 0,
+                hoistVelocity: 0,
+                aircraftYVelocity: 0,
+                cabinDoorRightZ: 0,
+                cabinDoorLeftZ: 0,
+                cabinDoorRightInitZ: 0,
+                cabinDoorLeftInitZ: 0,
+                cabinDoorRightTargetState: 0,
+                cabinDoorLeftTargetState: 0,
+                cabinDoorRightProgress: 0,
+                cabinDoorLeftProgress: 0,
+                reconPanVelocity: 0,
+                reconTiltVelocity: 0,
+                engine1Velocity: 0,
+                engine2Velocity: 0,
+                collectiveVelocity: 0,
+                nKeyBrakeToggle: false,
+                shirasatoCollisionMeshes: [],
+                isShirasatoColliding: false,
+                physicsVelocityY: 0,
+                aircraftPos: null,
+                aircraftHeading: 0,
+                aircraftVelocity: new THREE.Vector3(0, 0, 0),
+                headingVelocity: 0,
+                internalCameras: [],
+                currentCameraIndex: -1,
+                cameraRotX: 0,
+                cameraRotY: 0,
+                smokeTimer: 0
+            };
+        }
+
+        let aircrafts = {
+            'scene_10glb': createAircraftState(),
+            'scene_20': createAircraftState(),
+            'scene_20_1': createAircraftState()
+        };
+
+        let activeAircraftKey = 'scene_20';
+
+        const collisionRaycaster = new THREE.Raycaster();
+        const keys = { comma: false, period: false, o: false, l: false, p: false, semicolon: false, w: false, s: false, a: false, d: false, q: false, e: false, b: false, r: false, f: false, c: false, v: false, arrowUp: false, arrowDown: false, arrowLeft: false, arrowRight: false, h: false, k: false, u: false, j: false, space: false, n: false, shift: false };
+
+        let lastTime = performance.now();
+
+        function initSyncSystem() {
+            const statusElem = document.getElementById('p2p-status');
+            const roomInput = document.getElementById('room-input');
+            const btnConnect = document.getElementById('btn-connect');
+            const fileInputContainer = document.getElementById('file-input-container');
+
+            btnConnect.addEventListener('click', () => {
+                const roomNumber = roomInput.value.trim();
+                if (!roomNumber) {
+                    alert('番号を入力してください');
+                    return;
+                }
+
+                if (syncChannel) {
+                    syncChannel.close();
+                }
+
+                syncChannel = new BroadcastChannel('flight_room_all_gimmicks_' + roomNumber);
+                
+                syncChannel.onmessage = (event) => {
+                    try {
+                        const data = event.data;
+                        if (data.type === 'SYNC_ALL_STATES') {
+                            if (data.states) {
+                                for (const key in data.states) {
+                                    if (aircrafts[key] && aircrafts[key].group) {
+                                        const remoteState = data.states[key];
+                                        const ac = aircrafts[key];
+                                        
+                                        // 位置・姿勢・スロットル・被弾の同期
+                                        ac.group.position.set(remoteState.pos.x, remoteState.pos.y, remoteState.pos.z);
+                                        ac.group.rotation.set(remoteState.rot.x, remoteState.rot.y, remoteState.rot.z, remoteState.rot.order);
+                                        if (ac.aircraftPos) {
+                                            ac.aircraftPos.copy(ac.group.position);
+                                        }
+                                        ac.currentThrottle = remoteState.throttle;
+                                        ac.hitCount = remoteState.hitCount;
+                                        ac.aircraftHeading = remoteState.heading;
+
+                                        // 全ボーン・ギミックの完全同期
+                                        ac.collectiveAngle = remoteState.collectiveAngle;
+                                        ac.engine1Angle = remoteState.engine1Angle;
+                                        ac.engine2Angle = remoteState.engine2Angle;
+                                        ac.cyclicXProgress = remoteState.cyclicXProgress;
+                                        ac.cyclicZProgress = remoteState.cyclicZProgress;
+                                        ac.antiTorqueProgress = remoteState.antiTorqueProgress;
+                                        ac.hoistY = remoteState.hoistY;
+                                        ac.cabinDoorRightProgress = remoteState.cabinDoorRightProgress;
+                                        ac.cabinDoorLeftProgress = remoteState.cabinDoorLeftProgress;
+                                        ac.reconPanVelocity = remoteState.reconPanVelocity;
+                                        ac.reconTiltVelocity = remoteState.reconTiltVelocity;
+                                        ac.brakeProgress = remoteState.brakeProgress;
+
+                                        ac.doorGunRightTiltProgress = remoteState.doorGunRightTiltProgress;
+                                        ac.doorGunRightPanProgress = remoteState.doorGunRightPanProgress;
+                                        ac.doorGunLeftTiltProgress = remoteState.doorGunLeftTiltProgress;
+                                        ac.doorGunLeftPanProgress = remoteState.doorGunLeftPanProgress;
+
+                                        if (ac.mainRotorBone) ac.mainRotorBone.rotation.y = remoteState.mainRotorRotY;
+                                        if (ac.tailRotorBone) ac.tailRotorBone.rotation.x = remoteState.tailRotorRotX;
+                                        if (ac.hoistBone) ac.hoistBone.position.y = ac.hoistY;
+                                        if (ac.rotorBrakeBone) ac.rotorBrakeBone.rotation.x = remoteState.rotorBrakeRotX;
+                                        if (ac.horizontalStabBone) ac.horizontalStabBone.rotation.x = remoteState.horizontalStabRotX;
+                                        if (ac.engine1Bone) ac.engine1Bone.rotation.x = ac.engine1Angle;
+                                        if (ac.engine2Bone) ac.engine2Bone.rotation.x = ac.engine2Angle;
+
+                                        if (ac.collectivePltBone) ac.collectivePltBone.rotation.x = ac.collectiveAngle;
+                                        if (ac.collectiveCpltBone) ac.collectiveCpltBone.rotation.x = ac.collectiveAngle;
+
+                                        if (ac.doorGunRightTiltBone) ac.doorGunRightTiltBone.rotation.z = ac.doorGunRightTiltProgress;
+                                        if (ac.doorGunRightPanBone) ac.doorGunRightPanBone.rotation.y = ac.doorGunRightPanProgress;
+                                        if (ac.doorGunLeftTiltBone) ac.doorGunLeftTiltBone.rotation.z = ac.doorGunLeftTiltProgress;
+                                        if (ac.doorGunLeftPanBone) ac.doorGunLeftPanBone.rotation.y = ac.doorGunLeftPanProgress;
+
+                                        if (ac.cabinDoorRightBone) {
+                                            ac.cabinDoorRightBone.position.z = ac.cabinDoorRightInitZ + (-22.375) * ac.cabinDoorRightProgress;
+                                        }
+                                        if (ac.cabinDoorLeftBone) {
+                                            ac.cabinDoorLeftBone.position.z = ac.cabinDoorLeftInitZ + (-22.375) * ac.cabinDoorLeftProgress;
+                                        }
+                                    }
+                                }
+                            }
+                        } else if (data.type === 'REQUEST_MODEL') {
+                            if (storedGlbBuffer) {
+                                syncChannel.postMessage({
+                                    type: 'SEND_MODEL',
+                                    buffer: storedGlbBuffer
+                                });
+                            }
+                        } else if (data.type === 'SEND_MODEL') {
+                            if (!currentModel && data.buffer) {
+                                loadGLB(data.buffer);
+                                statusElem.textContent = `状態: ホストからモデルを受信完了`;
+                            }
+                        }
+                    } catch(e) {}
+                };
+
+                isConnected = true;
+                statusElem.textContent = `状態: 接続成功 (部屋番号: ${roomNumber})`;
+
+                if (!storedGlbBuffer) {
+                    fileInputContainer.style.display = 'none';
+                    statusElem.textContent = `状態: ホストのモデルを待機中...`;
+                    syncChannel.postMessage({ type: 'REQUEST_MODEL' });
+                }
+            });
+        }
+
+        function sendStateToPeers() {
+            if (isConnected && syncChannel) {
+                const statesPayload = {};
+                for (const key in aircrafts) {
+                    const ac = aircrafts[key];
+                    if (ac.group) {
+                        statesPayload[key] = {
+                            pos: { x: ac.group.position.x, y: ac.group.position.y, z: ac.group.position.z },
+                            rot: { x: ac.group.rotation.x, y: ac.group.rotation.y, z: ac.group.rotation.z, order: ac.group.rotation.order },
+                            throttle: ac.currentThrottle,
+                            hitCount: ac.hitCount,
+                            heading: ac.aircraftHeading,
+                            collectiveAngle: ac.collectiveAngle,
+                            engine1Angle: ac.engine1Angle,
+                            engine2Angle: ac.engine2Angle,
+                            cyclicXProgress: ac.cyclicXProgress,
+                            cyclicZProgress: ac.cyclicZProgress,
+                            antiTorqueProgress: ac.antiTorqueProgress,
+                            hoistY: ac.hoistY,
+                            cabinDoorRightProgress: ac.cabinDoorRightProgress,
+                            cabinDoorLeftProgress: ac.cabinDoorLeftProgress,
+                            reconPanVelocity: ac.reconPanVelocity,
+                            reconTiltVelocity: ac.reconTiltVelocity,
+                            brakeProgress: ac.brakeProgress,
+                            doorGunRightTiltProgress: ac.doorGunRightTiltProgress,
+                            doorGunRightPanProgress: ac.doorGunRightPanProgress,
+                            doorGunLeftTiltProgress: ac.doorGunLeftTiltProgress,
+                            doorGunLeftPanProgress: ac.doorGunLeftPanProgress,
+                            mainRotorRotY: ac.mainRotorBone ? ac.mainRotorBone.rotation.y : 0,
+                            tailRotorRotX: ac.tailRotorBone ? ac.tailRotorBone.rotation.x : 0,
+                            rotorBrakeRotX: ac.rotorBrakeBone ? ac.rotorBrakeBone.rotation.x : 0,
+                            horizontalStabRotX: ac.horizontalStabBone ? ac.horizontalStabBone.rotation.x : 0
+                        };
+                    }
+                }
+                syncChannel.postMessage({
+                    type: 'SYNC_ALL_STATES',
+                    states: statesPayload
+                });
+            }
+        }
+
+        function createAttitudeIndicatorTexture() {
+            const canvas = document.createElement('canvas');
+            canvas.width = 512;
+            canvas.height = 512;
+            const ctx = canvas.getContext('2d');
+
+            function draw(roll = 0, pitch = 0) {
+                ctx.fillStyle = '#000000';
+                ctx.fillRect(0, 0, 512, 512);
+
+                ctx.save();
+                ctx.translate(256, 256);
+                ctx.rotate(-roll);
+
+                const pitchOffset = pitch * 3.0;
+                ctx.translate(0, pitchOffset);
+
+                ctx.fillStyle = '#7395ae';
+                ctx.fillRect(-600, -1000, 1200, 1000);
+
+                ctx.fillStyle = '#8b5a2b';
+                ctx.fillRect(-600, 0, 1200, 1000);
+
+                ctx.strokeStyle = '#ffffff';
+                ctx.lineWidth = 4;
+                ctx.beginPath();
+                ctx.moveTo(-600, 0);
+                ctx.lineTo(600, 0);
+                ctx.stroke();
+
+                ctx.lineWidth = 2;
+                ctx.fillStyle = '#ffffff';
+                ctx.font = '16px sans-serif';
+                ctx.textAlign = 'center';
+
+                for (let p = -30; p <= 30; p += 10) {
+                    if (p === 0) continue;
+                    const y = -p * 10;
+                    ctx.beginPath();
+                    const w = (p % 20 === 0) ? 60 : 30;
+                    ctx.moveTo(-w, y);
+                    ctx.lineTo(w, y);
+                    ctx.stroke();
+
+                    if (p % 20 === 0) {
+                        ctx.fillText(Math.abs(p), -w - 20, y + 6);
+                        ctx.fillText(Math.abs(p), w + 20, y + 6);
+                    }
+                }
+
+                ctx.restore();
+
+                ctx.strokeStyle = '#ffffff';
+                ctx.lineWidth = 4;
+
+                ctx.beginPath();
+                ctx.arc(256, 256, 180, 0, Math.PI * 2);
+                ctx.stroke();
+
+                ctx.fillStyle = '#ffd700';
+                ctx.beginPath();
+                ctx.moveTo(256, 266);
+                ctx.lineTo(236, 276);
+                ctx.lineTo(216, 276);
+                ctx.lineTo(216, 266);
+                ctx.lineTo(246, 256);
+                ctx.lineTo(256, 256);
+                ctx.closePath();
+                ctx.fill();
+
+                ctx.beginPath();
+                ctx.moveTo(256, 266);
+                ctx.lineTo(276, 276);
+                ctx.lineTo(296, 276);
+                ctx.lineTo(296, 266);
+                ctx.lineTo(266, 256);
+                ctx.lineTo(256, 256);
+                ctx.closePath();
+                ctx.fill();
+
+                ctx.fillStyle = '#ffd700';
+                ctx.fillRect(252, 246, 8, 20);
+
+                ctx.fillStyle = '#ffffff';
+                ctx.font = 'bold 14px sans-serif';
+                ctx.fillText('CMD', 120, 110);
+                ctx.fillText('ATT', 390, 110);
+
+                ctx.fillStyle = '#cc0000';
+                ctx.fillRect(90, 80, 70, 25);
+                ctx.fillRect(350, 80, 70, 25);
+                ctx.fillStyle = '#ffffff';
+                ctx.beginPath();
+                for(let i = 80; i < 160; i += 15) {
+                    ctx.moveTo(i, 105); ctx.lineTo(i + 10, 80); ctx.lineTo(i + 15, 80); ctx.lineTo(i + 5, 105);
+                }
+                ctx.fill();
+            }
+
+            draw(0, 0);
+            const texture = new THREE.CanvasTexture(canvas);
+            texture.colorSpace = THREE.SRGBColorSpace;
+            return { texture, draw };
+        }
+
+        function init() {
+            const container = document.getElementById('canvas-container');
+
+            scene = new THREE.Scene();
+            scene.background = new THREE.Color(0x222222);
+
+            camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 10000);
+            camera.position.set(0, 500, 2000);
+
+            renderer = new THREE.WebGLRenderer({ antialias: true });
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.setPixelRatio(window.devicePixelRatio);
+            renderer.outputColorSpace = THREE.SRGBColorSpace;
+            container.appendChild(renderer.domElement);
+
+            controls = new OrbitControls(camera, renderer.domElement);
+            controls.enableDamping = true;
+
+            const ambientLight = new THREE.AmbientLight(0xffffff, 1.5);
+            scene.add(ambientLight);
+
+            const directionalLight = new THREE.DirectionalLight(0xffffff, 2.5);
+            directionalLight.position.set(500, 1000, 500);
+            scene.add(directionalLight);
+
+            window.addEventListener('resize', onWindowResize);
+            initSyncSystem();
+
+            document.getElementById('btn-mh60').addEventListener('click', () => {
+                activeAircraftKey = 'scene_20';
+                controls.enabled = aircrafts['scene_20'].currentCameraIndex < 0;
+            });
+            document.getElementById('btn-mh602').addEventListener('click', () => {
+                activeAircraftKey = 'scene_20_1';
+                controls.enabled = aircrafts['scene_20_1'].currentCameraIndex < 0;
+            });
+            document.getElementById('btn-uh60j').addEventListener('click', () => {
+                activeAircraftKey = 'scene_10glb';
+                controls.enabled = aircrafts['scene_10glb'].currentCameraIndex < 0;
+            });
+
+            window.addEventListener('keydown', (e) => {
+                if (e.key === '6') {
+                    aircrafts[activeAircraftKey].activeWeaponSide = 6;
+                }
+                if (e.key === '7') {
+                    aircrafts[activeAircraftKey].activeWeaponSide = 7;
+                }
+
+                if (e.key === 'Shift') keys.shift = true;
+                if (e.key === ',' || e.key === '<') keys.comma = true;
+                if (e.key === '.' || e.key === '>') keys.period = true;
+                if (e.key.toLowerCase() === 'o') keys.o = true;
+                if (e.key.toLowerCase() === 'l') keys.l = true;
+                if (e.key.toLowerCase() === 'p') keys.p = true;
+                if (e.key === ';') keys.semicolon = true;
+                if (e.key.toLowerCase() === 'w') keys.w = true;
+                if (e.key.toLowerCase() === 's') keys.s = true;
+                if (e.key.toLowerCase() === 'a') keys.a = true;
+                if (e.key.toLowerCase() === 'd') keys.d = true;
+                if (e.key.toLowerCase() === 'q') keys.q = true;
+                if (e.key.toLowerCase() === 'e') keys.e = true;
+                if (e.key.toLowerCase() === 'b') keys.b = true;
+                if (e.key === ' ') keys.space = true;
+                if (e.key.toLowerCase() === 'n') {
+                    const ac = aircrafts[activeAircraftKey];
+                    if (!keys.n) {
+                        ac.nKeyBrakeToggle = !ac.nKeyBrakeToggle;
+                    }
+                    keys.n = true;
+                }
+                if (e.key.toLowerCase() === 'r') keys.r = true;
+                if (e.key.toLowerCase() === 'f') keys.f = true;
+                if (e.key.toLowerCase() === 'c') {
+                    const ac = aircrafts[activeAircraftKey];
+                    if (!keys.c) {
+                        ac.cabinDoorRightTargetState = 1 - ac.cabinDoorRightTargetState;
+                    }
+                    keys.c = true;
+                }
+                if (e.key.toLowerCase() === 'v') {
+                    const ac = aircrafts[activeAircraftKey];
+                    if (!keys.v) {
+                        ac.cabinDoorLeftTargetState = 1 - ac.cabinDoorLeftTargetState;
+                    }
+                    keys.v = true;
+                }
+                if (e.key.toLowerCase() === 'h') keys.h = true;
+                if (e.key.toLowerCase() === 'k') keys.k = true;
+                if (e.key.toLowerCase() === 'u') keys.u = true;
+                if (e.key.toLowerCase() === 'j') keys.j = true;
+                if (e.key === 'ArrowUp') keys.arrowUp = true;
+                if (e.key === 'ArrowDown') keys.arrowDown = true;
+                if (e.key === 'ArrowLeft') keys.arrowLeft = true;
+                if (e.key === 'ArrowRight') keys.arrowRight = true;
+
+                if (['1', '2', '3', '4', '5'].includes(e.key)) {
+                    const ac = aircrafts[activeAircraftKey];
+                    if (e.key === '5') {
+                        ac.currentCameraIndex = -1;
+                        controls.enabled = true;
+                    } else {
+                        const idx = parseInt(e.key) - 1;
+                        if (ac.internalCameras.length > 0) {
+                            ac.currentCameraIndex = idx % ac.internalCameras.length;
+                            ac.cameraRotX = 0;
+                            ac.cameraRotY = 0;
+                            controls.enabled = false;
+                        }
+                    }
+                }
+            });
+            window.addEventListener('keyup', (e) => {
+                if (e.key === 'Shift') keys.shift = false;
+                if (e.key === ',' || e.key === '<') keys.comma = false;
+                if (e.key === '.' || e.key === '>') keys.period = false;
+                if (e.key.toLowerCase() === 'o') keys.o = false;
+                if (e.key.toLowerCase() === 'l') keys.l = false;
+                if (e.key.toLowerCase() === 'p') keys.p = false;
+                if (e.key === ';') keys.semicolon = false;
+                if (e.key.toLowerCase() === 'w') keys.w = false;
+                if (e.key.toLowerCase() === 's') keys.s = false;
+                if (e.key.toLowerCase() === 'a') keys.a = false;
+                if (e.key.toLowerCase() === 'd') keys.d = false;
+                if (e.key.toLowerCase() === 'q') keys.q = false;
+                if (e.key.toLowerCase() === 'e') keys.e = false;
+                if (e.key.toLowerCase() === 'b') keys.b = false;
+                if (e.key === ' ') keys.space = false;
+                if (e.key.toLowerCase() === 'n') keys.n = false;
+                if (e.key.toLowerCase() === 'r') keys.r = false;
+                if (e.key.toLowerCase() === 'f') keys.f = false;
+                if (e.key.toLowerCase() === 'c') keys.c = false;
+                if (e.key.toLowerCase() === 'v') keys.v = false;
+                if (e.key.toLowerCase() === 'h') keys.h = false;
+                if (e.key.toLowerCase() === 'k') keys.k = false;
+                if (e.key.toLowerCase() === 'u') keys.u = false;
+                if (e.key.toLowerCase() === 'j') keys.j = false;
+                if (e.key === 'ArrowUp') keys.arrowUp = false;
+                if (e.key === 'ArrowDown') keys.arrowDown = false;
+                if (e.key === 'ArrowLeft') keys.arrowLeft = false;
+                if (e.key === 'ArrowRight') keys.arrowRight = false;
+            });
+
+            const fileInput = document.getElementById('glb-input');
+            fileInput.addEventListener('change', handleFileSelect);
+
+            animate();
+        }
+
+        function handleFileSelect(event) {
+            const file = event.target.files[0];
+            if (!file) return;
+
+            const reader = new FileReader();
+            reader.readAsArrayBuffer(file);
+            reader.onload = function (e) {
+                const contents = e.target.result;
+                storedGlbBuffer = contents;
+                loadGLB(contents);
+            };
+        }
+
+        function loadGLB(arrayBuffer) {
+            const loader = new GLTFLoader();
+            loader.parse(arrayBuffer, '', (gltf) => {
+                if (currentModel) {
+                    scene.remove(currentModel);
+                }
+
+                currentModel = gltf.scene;
+
+                aircrafts['scene_10glb'] = createAircraftState();
+                aircrafts['scene_20'] = createAircraftState();
+                aircrafts['scene_20_1'] = createAircraftState();
+
+                currentModel.traverse((node) => {
+                    if (node.isMesh) {
+                        node.frustumCulled = false;
+                        if (node.material) {
+                            if (Array.isArray(node.material)) {
+                                node.material.forEach(mat => {
+                                    mat.depthWrite = true;
+                                    mat.depthTest = true;
+                                });
+                            } else {
+                                node.material.depthWrite = true;
+                                node.material.depthTest = true;
+                            }
+                        }
+                    }
+
+                    if (node.name === 'scene_10glb') {
+                        aircrafts['scene_10glb'].group = node;
+                        node.traverse((child) => {
+                            if (child.isMesh) {
+                                aircrafts['scene_10glb'].shirasatoCollisionMeshes.push(child);
+                            }
+                        });
+                    }
+                    if (node.name === 'scene_20') {
+                        aircrafts['scene_20'].group = node;
+                        node.traverse((child) => {
+                            if (child.isMesh) {
+                                aircrafts['scene_20'].shirasatoCollisionMeshes.push(child);
+                            }
+                        });
+                    }
+                    if (node.name === 'scene_20_1') {
+                        aircrafts['scene_20_1'].group = node;
+                        node.traverse((child) => {
+                            if (child.isMesh) {
+                                aircrafts['scene_20_1'].shirasatoCollisionMeshes.push(child);
+                            }
+                        });
+                    }
+
+                    if (node.name === '白里基地') {
+                        node.traverse((child) => {
+                            if (child.isMesh) {
+                                if (child.material) {
+                                    if (Array.isArray(child.material)) {
+                                        child.material.forEach(mat => {
+                                            mat.polygonOffset = true;
+                                            mat.polygonOffsetFactor = 1;
+                                            mat.polygonOffsetUnits = 1;
+                                            mat.depthWrite = true;
+                                            mat.depthTest = true;
+                                        });
+                                    } else {
+                                        child.material.polygonOffset = true;
+                                        child.material.polygonOffsetFactor = 1;
+                                        child.material.polygonOffsetUnits = 1;
+                                        child.material.depthWrite = true;
+                                        child.material.depthTest = true;
+                                    }
+                                }
+
+                                const n = child.name;
+                                if (n === '白線' || /^白線_([1-9]|10)$/.test(n)) {
+                                    Object.values(aircrafts).forEach(ac => {
+                                        ac.shirasatoCollisionMeshes.push(child);
+                                    });
+                                }
+                            }
+                        });
+                    }
+                });
+
+                if (!aircrafts['scene_10glb'].group) aircrafts['scene_10glb'].group = currentModel;
+                if (!aircrafts['scene_20'].group) aircrafts['scene_20'].group = currentModel;
+                if (!aircrafts['scene_20_1'].group) aircrafts['scene_20_1'].group = currentModel;
+
+                Object.keys(aircrafts).forEach(key => {
+                    const ac = aircrafts[key];
+                    if (ac.group) {
+                        ac.aircraftPos = ac.group.position.clone();
+                    } else {
+                        ac.aircraftPos = new THREE.Vector3(0, 0, 0);
+                    }
+                });
+
+                setupAircraftBones(aircrafts['scene_10glb'], '', ['操縦手', '副操縦手', '救助手', '偵察カメラ']);
+                setupAircraftBones(aircrafts['scene_20'], '_1', ['操縦手_1', '副操縦手_1', 'ガンナー右', 'ガンナー左']);
+                setupAircraftBones(aircrafts['scene_20_1'], '_2', ['操縦手_2', '副操縦手_2', 'ガンナー右_1', 'ガンナー左_1']);
+
+                const box = new THREE.Box3().setFromObject(currentModel);
+                const size = box.getSize(new THREE.Vector3());
+                const maxDim = Math.max(size.x, size.y, size.z);
+                
+                const center = box.getCenter(new THREE.Vector3());
+                controls.target.copy(center);
+                camera.position.set(center.x, center.y + maxDim * 0.8, center.z + maxDim * 2.0);
+                controls.update();
+
+                scene.add(currentModel);
+            }, (error) => {
+                console.error('GLBの読み込みに失敗しました:', error);
+            });
+        }
+
+        function setupAircraftBones(ac, suffix, camNames) {
+            let foundCams = {};
+
+            currentModel.traverse((node) => {
+                if (node.isBone) {
+                    if (node.name === 'メインローター' + suffix) ac.mainRotorBone = node;
+                    if (node.name === 'テールローター' + suffix) ac.tailRotorBone = node;
+                    if (node.name === '偵察装置旋回' + suffix) ac.reconPanBone = node;
+                    if (node.name === '偵察装置上下' + suffix) ac.reconTiltBone = node;
+                    if (node.name === 'コレクティブCPLT' + suffix) ac.collectiveCpltBone = node;
+                    if (node.name === 'コレクティブPLT' + suffix) ac.collectivePltBone = node;
+                    if (node.name === 'ローターブレーキレバー' + suffix) ac.rotorBrakeBone = node;
+                    if (node.name === '水平安定板' + suffix) ac.horizontalStabBone = node;
+                    if (node.name === 'エンジン1回転数' + suffix) ac.engine1Bone = node;
+                    if (node.name === 'エンジン2回転数' + suffix) ac.engine2Bone = node;
+                    if (node.name === 'アンチトルクPLT右' + suffix) ac.antiTorquePltRightBone = node;
+                    if (node.name === 'アンチトルクPLT左' + suffix) ac.antiTorquePltLeftBone = node;
+                    if (node.name === 'アンチトルクCPLT左' + suffix) ac.antiTorqueCpltLeftBone = node;
+                    if (node.name === 'アンチトルクCPLT右' + suffix) ac.antiTorqueCpltRightBone = node;
+                    if (node.name === 'サイクリックPLT' + suffix) ac.cyclicPltBone = node;
+                    if (node.name === 'サイクリックCPLT' + suffix) ac.cyclicCpltBone = node;
+                    if (node.name === 'ホイスト' + suffix) {
+                        ac.hoistBone = node;
+                        ac.hoistY = node.position.y;
+                    }
+                    if (node.name === 'キャビンドア右' + suffix) {
+                        ac.cabinDoorRightBone = node;
+                        ac.cabinDoorRightInitZ = node.position.z;
+                        ac.cabinDoorRightZ = node.position.z;
+                    }
+                    if (node.name === 'キャビンドア左' + suffix) {
+                        ac.cabinDoorLeftBone = node;
+                        ac.cabinDoorLeftInitZ = node.position.z;
+                        ac.cabinDoorLeftZ = node.position.z;
+                    }
+                    if (ac === aircrafts['scene_20']) {
+                        if (node.name === 'ドアガン仰俯角右') ac.doorGunRightTiltBone = node;
+                        if (node.name === 'ドアガン旋回右') ac.doorGunRightPanBone = node;
+                        if (node.name === 'ドアガン仰俯角左') ac.doorGunLeftTiltBone = node;
+                        if (node.name === 'ドアガン旋回左') ac.doorGunLeftPanBone = node;
+                        if (node.name === 'ドアガン砲身右') ac.doorGunRightBarrelBone = node;
+                        if (node.name === 'ドアガン砲身左') ac.doorGunLeftBarrelBone = node;
+                    } else if (ac === aircrafts['scene_20_1']) {
+                        if (node.name === 'ドアガン仰俯角右_1') ac.doorGunRightTiltBone = node;
+                        if (node.name === 'ドアガン旋回右_1') ac.doorGunRightPanBone = node;
+                        if (node.name === 'ドアガン仰俯角左_1') ac.doorGunLeftTiltBone = node;
+                        if (node.name === 'ドアガン旋回左_1') ac.doorGunLeftPanBone = node;
+                        if (node.name === 'ドアガン砲身右_1') ac.doorGunRightBarrelBone = node;
+                        if (node.name === 'ドアガン砲身左_1') ac.doorGunLeftBarrelBone = node;
+                    }
+                }
+
+                if (node.name === '姿勢指示器1' + suffix || node.name === '姿勢指示器2' + suffix) {
+                    const { texture, draw } = createAttitudeIndicatorTexture();
+                    const material = new THREE.MeshBasicMaterial({ map: texture, depthWrite: true, depthTest: true });
+                    if (node.isMesh) {
+                        node.material = material;
+                    } else {
+                        node.traverse((child) => {
+                            if (child.isMesh) child.material = material;
+                        });
+                    }
+                    ac.attitudeIndicators.push({ node, draw });
+                }
+
+                if (camNames.includes(node.name)) {
+                    foundCams[node.name] = node;
+                }
+            });
+
+            camNames.forEach(name => {
+                if (foundCams[name]) {
+                    ac.internalCameras.push(foundCams[name]);
+                }
+            });
+        }
+
+        function onWindowResize() {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        }
+
+        let netTickTimer = 0;
+
+        function animate() {
+            requestAnimationFrame(animate);
+
+            const currentTime = performance.now();
+            const deltaTime = (currentTime - lastTime) / 1000;
+            lastTime = currentTime;
+
+            netTickTimer += deltaTime;
+            if (netTickTimer >= 0.03) {
+                netTickTimer = 0;
+                sendStateToPeers();
+            }
+
+            for (let i = tracers.length - 1; i >= 0; i--) {
+                const tr = tracers[i];
+                const moveDist = tr.velocity.clone().multiplyScalar(deltaTime);
+                
+                let hitDetected = false;
+                let checkTargets = [];
+                let targetAc = null;
+                if (tr.ownerAircraft === aircrafts['scene_20']) {
+                    checkTargets = aircrafts['scene_20_1'].shirasatoCollisionMeshes;
+                    targetAc = aircrafts['scene_20_1'];
+                } else if (tr.ownerAircraft === aircrafts['scene_20_1']) {
+                    checkTargets = aircrafts['scene_20'].shirasatoCollisionMeshes;
+                    targetAc = aircrafts['scene_20'];
+                }
+                
+                if (checkTargets.length > 0) {
+                    collisionRaycaster.set(tr.mesh.position, tr.velocity.clone().normalize());
+                    collisionRaycaster.far = moveDist.length();
+                    const intersects = collisionRaycaster.intersectObjects(checkTargets, true);
+                    if (intersects.length > 0) {
+                        hitDetected = true;
+                        if (targetAc) {
+                            targetAc.hitCount++;
+                            if (targetAc.hitCount >= 1000 && !targetAc.isDestroyed) {
+                                targetAc.isDestroyed = true;
+                                targetAc.currentThrottle = 0;
+                                
+                                const expPos = new THREE.Vector3();
+                                targetAc.group.getWorldPosition(expPos);
+                                for (let k = 0; k < 25; k++) {
+                                    const expGeom = new THREE.SphereGeometry((2.0 + Math.random() * 3.0) * 10, 6, 6);
+                                    const expMat = new THREE.MeshBasicMaterial({ 
+                                        color: Math.random() > 0.4 ? 0xff4500 : 0xffd700, 
+                                        transparent: true, 
+                                        opacity: 0.9, 
+                                        depthWrite: false 
+                                    });
+                                    const expMesh = new THREE.Mesh(expGeom, expMat);
+                                    expMesh.frustumCulled = false;
+                                    expMesh.position.copy(expPos).add(new THREE.Vector3((Math.random() - 0.5) * 10, (Math.random() - 0.5) * 10, (Math.random() - 0.5) * 10));
+                                    scene.add(expMesh);
+                                    explosionParticles.push({
+                                        mesh: expMesh,
+                                        velocity: new THREE.Vector3((Math.random() - 0.5) * 15, (5 + Math.random() * 20) * 10, (Math.random() - 0.5) * 15),
+                                        life: 1.0,
+                                        maxLife: 1.0
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+
+                tr.mesh.position.add(moveDist);
+                tr.life -= deltaTime;
+                if (tr.life <= 0 || hitDetected) {
+                    scene.remove(tr.mesh);
+                    tracers.splice(i, 1);
+                }
+            }
+
+            for (let i = smokeParticles.length - 1; i >= 0; i--) {
+                const sp = smokeParticles[i];
+                sp.mesh.position.add(sp.velocity.clone().multiplyScalar(deltaTime));
+                sp.mesh.scale.addScalar(deltaTime * 2.0);
+                sp.life -= deltaTime;
+                sp.mesh.material.opacity = Math.max(0, sp.life / sp.maxLife * 0.6);
+                if (sp.life <= 0) {
+                    scene.remove(sp.mesh);
+                    smokeParticles.splice(i, 1);
+                }
+            }
+
+            for (let i = explosionParticles.length - 1; i >= 0; i--) {
+                const ep = explosionParticles[i];
+                ep.mesh.position.add(ep.velocity.clone().multiplyScalar(deltaTime));
+                ep.mesh.scale.addScalar(deltaTime * 4.0);
+                ep.life -= deltaTime;
+                ep.mesh.material.opacity = Math.max(0, ep.life / ep.maxLife * 0.9);
+                if (ep.life <= 0) {
+                    scene.remove(ep.mesh);
+                    explosionParticles.splice(i, 1);
+                }
+            }
+
+            Object.keys(aircrafts).forEach(key => {
+                const ac = aircrafts[key];
+                const isActive = (key === activeAircraftKey);
+
+                if (ac.hitCount > 0 && ac.group) {
+                    ac.smokeTimer += deltaTime;
+                    if (ac.smokeTimer >= 0.3) {
+                        ac.smokeTimer = 0;
+                        const smokeGeom = new THREE.SphereGeometry(1.5 * 10, 4, 4);
+                        const smokeMat = new THREE.MeshBasicMaterial({ color: 0x333333, transparent: true, opacity: 0.6, depthWrite: true });
+                        const smokeMesh = new THREE.Mesh(smokeGeom, smokeMat);
+                        smokeMesh.frustumCulled = false;
+                        const worldPos = new THREE.Vector3();
+                        ac.group.getWorldPosition(worldPos);
+                        smokeMesh.position.copy(worldPos).add(new THREE.Vector3((Math.random() - 0.5) * 5, Math.random() * 5, (Math.random() - 0.5) * 5));
+                        scene.add(smokeMesh);
+                        smokeParticles.push({
+                            mesh: smokeMesh,
+                            velocity: new THREE.Vector3((Math.random() - 0.5) * 2, (5 + Math.random() * 5) * 10, (Math.random() - 0.5) * 2),
+                            life: 1.5,
+                            maxLife: 1.5
+                        });
+                    }
+                }
+
+                if (ac.isDestroyed) return;
+
+                if (isActive) {
+                    const loadBar = document.getElementById('load-bar');
+                    if (loadBar) loadBar.style.width = Math.min(100, (ac.hitCount / 1000) * 100) + '%';
+                    const rpmValueElem = document.getElementById('rpm-value');
+                    if (rpmValueElem) rpmValueElem.textContent = Math.round(ac.currentThrottle * 258);
+                }
+
+                let targetAntiTorque = 0;
+                if (isActive && keys.comma && !keys.period) targetAntiTorque = -1.0;
+                else if (isActive && keys.period && !keys.comma) targetAntiTorque = 1.0;
+                ac.antiTorqueProgress += (targetAntiTorque - ac.antiTorqueProgress) * Math.min(1.0, deltaTime * 0.5);
+
+                let targetHeadingVel = 0;
+                if (isActive && keys.comma) targetHeadingVel = 0.375;
+                else if (isActive && keys.period) targetHeadingVel = -0.375;
+                ac.headingVelocity += (targetHeadingVel - ac.headingVelocity) * Math.min(1.0, deltaTime * 2.0);
+                ac.aircraftHeading += ac.headingVelocity * (1.0 - Math.abs(ac.antiTorqueProgress) * 0.3) * deltaTime;
+
+                const maxAntiRad = THREE.MathUtils.degToRad(-36.39);
+                let leftAngle = 0, rightAngle = 0;
+                if (ac.antiTorqueProgress < 0) leftAngle = -maxAntiRad * Math.abs(ac.antiTorqueProgress);
+                else if (ac.antiTorqueProgress > 0) rightAngle = -maxAntiRad * ac.antiTorqueProgress;
+
+                if (ac.antiTorquePltLeftBone) ac.antiTorquePltLeftBone.rotation.x = leftAngle;
+                if (ac.antiTorqueCpltLeftBone) ac.antiTorqueCpltLeftBone.rotation.x = leftAngle;
+                if (ac.antiTorquePltRightBone) ac.antiTorquePltRightBone.rotation.x = rightAngle;
+                if (ac.antiTorqueCpltRightBone) ac.antiTorqueCpltRightBone.rotation.x = rightAngle;
+
+                ac.isShirasatoColliding = false;
+                if (ac.group && ac.shirasatoCollisionMeshes.length > 0) {
+                    collisionRaycaster.set(ac.group.position, new THREE.Vector3(0, -1, 0));
+                    collisionRaycaster.far = 18.803;
+                    const intersects = collisionRaycaster.intersectObjects(ac.shirasatoCollisionMeshes, true);
+                    if (intersects.length > 0 && intersects[0].distance <= 18.803) {
+                        ac.isShirasatoColliding = true;
+                    }
+                }
+
+                const allowWASD = isActive && !ac.isShirasatoColliding;
+
+                let targetCyclicXChange = 0;
+                if (allowWASD && keys.w && !keys.s) targetCyclicXChange = -1.0;
+                else if (allowWASD && keys.s && !keys.w) targetCyclicXChange = 1.0;
+                if (isActive && (keys.w || keys.s)) {
+                    ac.cyclicXProgress += targetCyclicXChange * deltaTime * 0.15;
+                    ac.cyclicXProgress = THREE.MathUtils.clamp(ac.cyclicXProgress, -1.0, 1.0);
+                }
+
+                let targetCyclicZChange = 0;
+                if (allowWASD && keys.a && !keys.d) targetCyclicZChange = -1.0;
+                else if (allowWASD && keys.d && !keys.a) targetCyclicZChange = 1.0;
+                if (allowWASD && (keys.a || keys.d)) {
+                    ac.cyclicZProgress += targetCyclicZChange * deltaTime * 0.05;
+                    ac.cyclicZProgress = THREE.MathUtils.clamp(ac.cyclicZProgress, -1.0, 1.0);
+                } else {
+                    ac.cyclicZProgress += (0 - ac.cyclicZProgress) * Math.min(1.0, deltaTime * 0.5);
+                }
+
+                const maxCyclicXRad = THREE.MathUtils.degToRad(-24);
+                const maxCyclicZRad = THREE.MathUtils.degToRad(12.98);
+                const cyclicXAngle = maxCyclicXRad * ac.cyclicXProgress;
+                const cyclicZAngle = maxCyclicZRad * ac.cyclicZProgress;
+
+                if (ac.cyclicPltBone) {
+                    ac.cyclicPltBone.rotation.x = cyclicXAngle;
+                    ac.cyclicPltBone.rotation.z = cyclicZAngle;
+                }
+                if (ac.cyclicCpltBone) {
+                    ac.cyclicCpltBone.rotation.x = cyclicXAngle;
+                    ac.cyclicCpltBone.rotation.z = cyclicZAngle;
+                }
+
+                let targetHoistVel = 0;
+                if (isActive && keys.r && !keys.f) targetHoistVel = 5.0;
+                else if (isActive && keys.f && !keys.r) targetHoistVel = -5.0;
+                ac.hoistVelocity += (targetHoistVel - ac.hoistVelocity) * Math.min(1.0, deltaTime * 2.5);
+                ac.hoistY += ac.hoistVelocity * deltaTime;
+                if (ac.hoistY > 23.442) ac.hoistY = 23.442;
+                if (ac.hoistY < -232) ac.hoistY = -232;
+                if (ac.hoistBone) ac.hoistBone.position.y = ac.hoistY;
+
+                if (ac.cabinDoorRightTargetState === 1) {
+                    ac.cabinDoorRightProgress += deltaTime / 2.0;
+                    if (ac.cabinDoorRightProgress > 1.0) ac.cabinDoorRightProgress = 1.0;
+                } else {
+                    ac.cabinDoorRightProgress -= deltaTime / 2.0;
+                    if (ac.cabinDoorRightProgress < 0.0) ac.cabinDoorRightProgress = 0.0;
+                }
+                if (ac.cabinDoorRightBone) {
+                    ac.cabinDoorRightZ = ac.cabinDoorRightInitZ + (-22.375) * ac.cabinDoorRightProgress;
+                    ac.cabinDoorRightBone.position.z = ac.cabinDoorRightZ;
+                }
+
+                if (ac.cabinDoorLeftTargetState === 1) {
+                    ac.cabinDoorLeftProgress += deltaTime / 2.0;
+                    if (ac.cabinDoorLeftProgress > 1.0) ac.cabinDoorLeftProgress = 1.0;
+                } else {
+                    ac.cabinDoorLeftProgress -= deltaTime / 2.0;
+                    if (ac.cabinDoorLeftProgress < 0.0) ac.cabinDoorLeftProgress = 0.0;
+                }
+                if (ac.cabinDoorLeftBone) {
+                    ac.cabinDoorLeftZ = ac.cabinDoorLeftInitZ + (-22.375) * ac.cabinDoorLeftProgress;
+                    ac.cabinDoorLeftBone.position.z = ac.cabinDoorLeftZ;
+                }
+
+                const minEngineRad = THREE.MathUtils.degToRad(-54.11);
+                const maxEngineRad = 0;
+                let targetEngine1 = ac.engine1Angle;
+                if (isActive && keys.o) targetEngine1 = maxEngineRad;
+                if (isActive && keys.l) targetEngine1 = minEngineRad;
+                ac.engine1Velocity += ((targetEngine1 - ac.engine1Angle) * 1.5 - ac.engine1Velocity) * Math.min(1.0, deltaTime * 3.0);
+                ac.engine1Angle += ac.engine1Velocity * deltaTime;
+                if (ac.engine1Angle > maxEngineRad) ac.engine1Angle = maxEngineRad;
+                if (ac.engine1Angle < minEngineRad) ac.engine1Angle = minEngineRad;
+
+                let targetEngine2 = ac.engine2Angle;
+                if (isActive && keys.p) targetEngine2 = maxEngineRad;
+                if (isActive && keys.semicolon) targetEngine2 = minEngineRad;
+                ac.engine2Velocity += ((targetEngine2 - ac.engine2Angle) * 1.5 - ac.engine2Velocity) * Math.min(1.0, deltaTime * 3.0);
+                ac.engine2Angle += ac.engine2Velocity * deltaTime;
+                if (ac.engine2Angle > maxEngineRad) ac.engine2Angle = maxEngineRad;
+                if (ac.engine2Angle < minEngineRad) ac.engine2Angle = minEngineRad;
+
+                if (ac.engine1Bone) ac.engine1Bone.rotation.x = ac.engine1Angle;
+                if (ac.engine2Bone) ac.engine2Bone.rotation.x = ac.engine2Angle;
+
+                const minStabRad = THREE.MathUtils.degToRad(-31.01);
+                const maxStabRad = THREE.MathUtils.degToRad(19.78);
+                ac.stabAngle = THREE.MathUtils.mapLinear(ac.cyclicXProgress, -1, 1, maxStabRad, minStabRad);
+                if (ac.horizontalStabBone) ac.horizontalStabBone.rotation.x = ac.stabAngle;
+
+                const minRad = THREE.MathUtils.degToRad(-23);
+                const maxRad = 0;
+                let targetCollective = ac.collectiveAngle;
+                if (isActive && keys.q) targetCollective = minRad;
+                if (isActive && keys.e) targetCollective = maxRad;
+                ac.collectiveVelocity += ((targetCollective - ac.collectiveAngle) * 0.5 - ac.collectiveVelocity) * Math.min(1.0, deltaTime * 3.0);
+                ac.collectiveAngle += ac.collectiveVelocity * deltaTime;
+                if (ac.collectiveAngle < minRad) ac.collectiveAngle = minRad;
+                if (ac.collectiveAngle > maxRad) ac.collectiveAngle = maxRad;
+
+                if (ac.collectiveCpltBone) ac.collectiveCpltBone.rotation.x = ac.collectiveAngle;
+                if (ac.collectivePltBone) ac.collectivePltBone.rotation.x = ac.collectiveAngle;
+
+                const avgEngineAngle = (ac.engine1Angle + ac.engine2Angle) / 2;
+                let targetThrottle = 0;
+                const isEngineMax = Math.abs(avgEngineAngle - minEngineRad) < 0.001;
+                if (isEngineMax) {
+                    targetThrottle = THREE.MathUtils.mapLinear(ac.collectiveAngle, 0, minRad, 67 / 258, 1.0);
+                } else {
+                    const engineProgress = Math.abs(avgEngineAngle / minEngineRad);
+                    targetThrottle = (67 / 258) * engineProgress * (1.0 - Math.abs(ac.collectiveAngle) / Math.abs(minRad) * 0.5);
+                }
+                ac.currentThrottle += (targetThrottle - ac.currentThrottle) * 0.0003;
+
+                const currentRpm = ac.currentThrottle * 258;
+                const isCollectiveZero = Math.abs(ac.collectiveAngle) < 0.001;
+                const isRpmInRange = currentRpm >= 0 && currentRpm <= 200;
+                const canBrake = isCollectiveZero && ac.brakeLoad < 100 && isRpmInRange;
+                const isBrakingActive = isActive && (keys.b || keys.space || ac.nKeyBrakeToggle);
+
+                if (isBrakingActive && canBrake) {
+                    ac.brakeProgress += deltaTime / 1.0;
+                    if (ac.brakeProgress > 1.0) ac.brakeProgress = 1.0;
+                } else {
+                    ac.brakeProgress -= deltaTime / 1.0;
+                    if (ac.brakeProgress < 0.0) ac.brakeProgress = 0.0;
+                }
+
+                if (ac.rotorBrakeBone) {
+                    ac.rotorBrakeBone.rotation.x = THREE.MathUtils.degToRad(-50.64) * ac.brakeProgress;
+                }
+
+                if (ac.currentThrottle > 0.0001) {
+                    if (ac.mainRotorBone) ac.mainRotorBone.rotation.y += ac.currentThrottle * 1.0;
+                    if (ac.tailRotorBone) ac.tailRotorBone.rotation.x += ac.currentThrottle * 2.0;
+                }
+
+                if (isActive && ac.group && ac.aircraftPos) {
+                    let targetAircraftYVel = 0;
+                    if (isActive && keys.q && !keys.e && currentRpm > 130) {
+                        targetAircraftYVel = 36;
+                    } else if (isActive && keys.e && !keys.q) {
+                        targetAircraftYVel = -36;
+                    }
+                    ac.aircraftYVelocity += (targetAircraftYVel - ac.aircraftYVelocity) * Math.min(1.0, deltaTime * 3.0);
+                    ac.aircraftPos.y += ac.aircraftYVelocity * deltaTime;
+                    
+                    const groundY = ac.group.initialY !== undefined ? ac.group.initialY : 0;
+                    if (ac.aircraftPos.y < groundY) ac.aircraftPos.y = groundY;
+                    if (ac.aircraftPos.y > groundY + 6000) ac.aircraftPos.y = groundY + 6000;
+
+                    if (currentRpm <= 130) {
+                        ac.physicsVelocityY -= 9.8 * 50 * deltaTime;
+                        ac.aircraftPos.y += ac.physicsVelocityY * deltaTime;
+                        if (ac.aircraftPos.y < groundY) {
+                            ac.aircraftPos.y = groundY;
+                            ac.physicsVelocityY = 0;
+                        }
+                    } else {
+                        ac.physicsVelocityY = 0;
+                    }
+
+                    const maxPitchDeg = 60 * ac.cyclicXProgress;
+                    const pitchAngle = THREE.MathUtils.degToRad(maxPitchDeg);
+
+                    let targetForwardSpeed = 0;
+                    const absPitchDeg = Math.abs(maxPitchDeg);
+                    if (absPitchDeg > 2 && absPitchDeg <= 60) {
+                        targetForwardSpeed = (((maxPitchDeg / 60) * 800.0) * (currentRpm / 258)) * 0.4;
+                    } else if (currentRpm >= 77 && !isBrakingActive && !(isActive && keys.q)) {
+                        targetForwardSpeed = (150.0 * Math.min(1.0, currentRpm / 129)) * 0.1;
+                    }
+                    if (isBrakingActive) targetForwardSpeed = 0;
+
+                    let currentForwardSpeed = ac.aircraftVelocity.z;
+                    currentForwardSpeed += (targetForwardSpeed - currentForwardSpeed) * Math.min(1.0, deltaTime * 2.0 * (1.0 + absPitchDeg / 60.0 * 1.5));
+                    if (isBrakingActive) currentForwardSpeed *= Math.max(0, 1.0 - deltaTime * 5.0);
+                    ac.aircraftVelocity.z = currentForwardSpeed;
+
+                    ac.aircraftPos.x += Math.sin(ac.aircraftHeading) * currentForwardSpeed * deltaTime;
+                    ac.aircraftPos.z += Math.cos(ac.aircraftHeading) * currentForwardSpeed * deltaTime;
+
+                    const maxRollDeg = 43 * ac.cyclicZProgress;
+                    const rollAngle = THREE.MathUtils.degToRad(maxRollDeg);
+                    let targetLateralSpeed = -(((maxRollDeg / 43) * 480.0) * (currentRpm / 258)) * 0.4;
+                    if (isBrakingActive) targetLateralSpeed = 0;
+
+                    let currentLateralSpeed = ac.aircraftVelocity.x;
+                    currentLateralSpeed += (targetLateralSpeed - currentLateralSpeed) * Math.min(1.0, deltaTime * 2.0 * (1.0 + Math.abs(maxRollDeg) / 43.0 * 1.5));
+                    if (isBrakingActive) currentLateralSpeed *= Math.max(0, 1.0 - deltaTime * 5.0);
+                    ac.aircraftVelocity.x = currentLateralSpeed;
+
+                    ac.aircraftPos.x += Math.cos(ac.aircraftHeading) * currentLateralSpeed * deltaTime;
+                    ac.aircraftPos.z -= Math.sin(ac.aircraftHeading) * currentLateralSpeed * deltaTime;
+
+                    ac.group.position.copy(ac.aircraftPos);
+                    ac.group.rotation.set(pitchAngle, ac.aircraftHeading, rollAngle, 'YXZ');
+                }
+
+                if (ac.attitudeIndicators.length > 0) {
+                    const simRoll = -ac.cyclicZProgress * (43 / 12.98);
+                    const simPitch = ac.cyclicXProgress * (60 / 24);
+                    ac.attitudeIndicators.forEach(item => {
+                        item.draw(simRoll, simPitch);
+                        if (item.node.material && item.node.material.map) {
+                            item.node.material.map.needsUpdate = true;
+                        }
+                    });
+                }
+
+                const mechSpeed = 0.03;
+                let targetPanVel = 0;
+                if (isActive && keys.h) targetPanVel = mechSpeed;
+                else if (isActive && keys.k) targetPanVel = -mechSpeed;
+                ac.reconPanVelocity += (targetPanVel - ac.reconPanVelocity) * Math.min(1.0, deltaTime * 5.0);
+                if (ac.reconPanBone) ac.reconPanBone.rotation.y += ac.reconPanVelocity;
+
+                let targetTiltVel = 0;
+                if (isActive && keys.u) targetTiltVel = -mechSpeed;
+                else if (isActive && keys.j) targetTiltVel = mechSpeed;
+                ac.reconTiltVelocity += (targetTiltVel - ac.reconTiltVelocity) * Math.min(1.0, deltaTime * 5.0);
+                if (ac.reconTiltBone) ac.reconTiltBone.rotation.x += ac.reconTiltVelocity;
+
+                const gunSpeed = 0.03;
+                if (isActive) {
+                    if (key === 'scene_20' || key === 'scene_20_1') {
+                        const targetRightBarrelVel = (keys.shift && ac.activeWeaponSide === 6) ? 300.0 : 0;
+                        const targetLeftBarrelVel = (keys.shift && ac.activeWeaponSide === 7) ? 300.0 : 0;
+                        
+                        ac.doorGunRightBarrelVel += (targetRightBarrelVel - ac.doorGunRightBarrelVel) * Math.min(1.0, deltaTime * 4.0);
+                        ac.doorGunLeftBarrelVel += (targetLeftBarrelVel - ac.doorGunLeftBarrelVel) * Math.min(1.0, deltaTime * 4.0);
+
+                        if (ac.doorGunRightBarrelBone) ac.doorGunRightBarrelBone.rotation.x += ac.doorGunRightBarrelVel * deltaTime;
+                        if (ac.doorGunLeftBarrelBone) ac.doorGunLeftBarrelBone.rotation.x += ac.doorGunLeftBarrelVel * deltaTime;
+
+                        if (keys.shift && ((ac.activeWeaponSide === 6 && ac.doorGunRightBarrelBone) || (ac.activeWeaponSide === 7 && ac.doorGunLeftBarrelBone))) {
+                            const activeBarrel = ac.activeWeaponSide === 6 ? ac.doorGunRightBarrelBone : ac.doorGunLeftBarrelBone;
+                            ac.isFiring = true;
+                            ac.fireTimer += deltaTime;
+                            if (ac.fireTimer >= 2.0) {
+                                const fireInterval = 60 / 3000; 
+                                if (!ac.lastFireTime) ac.lastFireTime = 0;
+                                if (currentTime - ac.lastFireTime >= fireInterval * 1000) {
+                                    ac.lastFireTime = currentTime;
+                                    const worldPos = new THREE.Vector3();
+                                    const worldQuat = new THREE.Quaternion();
+                                    activeBarrel.getWorldPosition(worldPos);
+                                    activeBarrel.getWorldQuaternion(worldQuat);
+
+                                    const geom = new THREE.SphereGeometry(0.3, 4, 4);
+                                    const mat = new THREE.MeshBasicMaterial({ color: 0xffaa00, depthWrite: true });
+                                    const tracerMesh = new THREE.Mesh(geom, mat);
+                                    tracerMesh.frustumCulled = false;
+                                    tracerMesh.position.copy(worldPos);
+                                    scene.add(tracerMesh);
+
+                                    const trVelX = ac.activeWeaponSide === 7 ? 2000.0 : -2000.0;
+                                    const fireDir = new THREE.Vector3(trVelX, 0, 0).applyQuaternion(worldQuat);
+                                    tracers.push({ mesh: tracerMesh, velocity: fireDir, life: 3.0, ownerAircraft: ac });
+                                }
+                            }
+                        } else {
+                            ac.fireTimer = 0;
+                            ac.lastFireTime = 0;
+                        }
+
+                        if (ac.activeWeaponSide === 6) {
+                            let tiltDir = 0;
+                            if (keys.u) tiltDir = 1;
+                            else if (keys.j) tiltDir = -1;
+                            ac.doorGunRightTiltVel += (tiltDir * gunSpeed - ac.doorGunRightTiltVel) * Math.min(1.0, deltaTime * 5.0);
+                            ac.doorGunRightTiltProgress += ac.doorGunRightTiltVel;
+                            const maxRad = THREE.MathUtils.degToRad(44);
+                            ac.doorGunRightTiltProgress = THREE.MathUtils.clamp(ac.doorGunRightTiltProgress, -maxRad, maxRad);
+                            if (ac.doorGunRightTiltBone) ac.doorGunRightTiltBone.rotation.z = ac.doorGunRightTiltProgress;
+
+                            let panDir = 0;
+                            if (keys.h) panDir = 1;
+                            else if (keys.k) panDir = -1;
+                            ac.doorGunRightPanVel += (panDir * gunSpeed - ac.doorGunRightPanVel) * Math.min(1.0, deltaTime * 5.0);
+                            ac.doorGunRightPanProgress += ac.doorGunRightPanVel;
+                            const maxPanRad = THREE.MathUtils.degToRad(44);
+                            ac.doorGunRightPanProgress = THREE.MathUtils.clamp(ac.doorGunRightPanProgress, -maxPanRad, maxPanRad);
+                            if (ac.doorGunRightPanBone) ac.doorGunRightPanBone.rotation.y = ac.doorGunRightPanProgress;
+                        } else if (ac.activeWeaponSide === 7) {
+                            let tiltDir = 0;
+                            if (keys.u) tiltDir = -1;
+                            else if (keys.j) tiltDir = 1;
+                            ac.doorGunLeftTiltVel += (tiltDir * gunSpeed - ac.doorGunLeftTiltVel) * Math.min(1.0, deltaTime * 5.0);
+                            ac.doorGunLeftTiltProgress += ac.doorGunLeftTiltVel;
+                            const maxRad = THREE.MathUtils.degToRad(44);
+                            ac.doorGunLeftTiltProgress = THREE.MathUtils.clamp(ac.doorGunLeftTiltProgress, -maxRad, maxRad);
+                            if (ac.doorGunLeftTiltBone) ac.doorGunLeftTiltBone.rotation.z = ac.doorGunLeftTiltProgress;
+
+                            let panDir = 0;
+                            if (keys.h) panDir = 1;
+                            else if (keys.k) panDir = -1;
+                            ac.doorGunLeftPanVel += (panDir * gunSpeed - ac.doorGunLeftPanVel) * Math.min(1.0, deltaTime * 5.0);
+                            ac.doorGunLeftPanProgress += ac.doorGunLeftPanVel;
+                            const maxPanRad = THREE.MathUtils.degToRad(44);
+                            ac.doorGunLeftPanProgress = THREE.MathUtils.clamp(ac.doorGunLeftPanProgress, -maxPanRad, maxPanRad);
+                            if (ac.doorGunLeftPanBone) ac.doorGunLeftPanBone.rotation.y = ac.doorGunLeftPanProgress;
+                        }
+                    }
+                }
+            });
+
+            const activeAc = aircrafts[activeAircraftKey];
+            if (activeAc.currentCameraIndex >= 0 && activeAc.internalCameras[activeAc.currentCameraIndex]) {
+                const targetObj = activeAc.internalCameras[activeAc.currentCameraIndex];
+                const worldPos = new THREE.Vector3();
+                targetObj.getWorldPosition(worldPos);
+                camera.position.copy(worldPos);
+
+                const rotSpeed = 0.03;
+                if (keys.arrowUp) activeAc.cameraRotX += rotSpeed;
+                if (keys.arrowDown) activeAc.cameraRotX -= rotSpeed;
+                if (keys.arrowLeft) activeAc.cameraRotY += rotSpeed;
+                if (keys.arrowRight) activeAc.cameraRotY -= rotSpeed;
+
+                const worldQuaternion = new THREE.Quaternion();
+                targetObj.getWorldQuaternion(worldQuaternion);
+                const baseEuler = new THREE.Euler().setFromQuaternion(worldQuaternion, 'YXZ');
+                baseEuler.x += activeAc.cameraRotX;
+                baseEuler.y += activeAc.cameraRotY;
+                baseEuler.z = 0;
+
+                camera.quaternion.setFromEuler(baseEuler);
+            } else {
+                controls.update();
+            }
+
+            renderer.render(scene, camera);
+        }
+
+        init();
+    </script>
+</body>
+</html>
